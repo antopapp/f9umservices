@@ -1,14 +1,30 @@
 import hashlib
 import os
-from flask import Flask, render_template, request, jsonify
+import sqlite3
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 import cloudscraper
 import requests
 from dotenv import load_dotenv
+from authlib.integrations.flask_client import OAuth
 
 load_dotenv()
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "une_cle_secrete_par_defaut")
 
+# --- CONFIGURATION OAUTH DISCORD ---
+oauth = OAuth(app)
+discord = oauth.register(
+    name='discord',
+    client_id=os.environ.get('DISCORD_CLIENT_ID'),
+    client_secret=os.environ.get('DISCORD_CLIENT_SECRET'),
+    access_token_url='https://discord.com/api/oauth2/token',
+    authorize_url='https://discord.com/api/oauth2/authorize',
+    api_base_url='https://discord.com/api/',
+    client_kwargs={'scope': 'identify email'}
+)
+
+# --- CONFIGURATION API TIERS ---
 BRIX_API_KEY = os.environ.get("BRIX_API_KEY", "brix_votre_cle_api")
 VT_API_KEY = os.environ.get("VT_API_KEY", "votre_cle_virustotal")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "TON_WEBHOOK_DISCORD_ICI")
@@ -19,6 +35,25 @@ VT_URL = "https://www.virustotal.com/api/v3/files/"
 
 # Création d'un scraper capable de contourner Cloudflare
 scraper = cloudscraper.create_scraper()
+
+# --- INITIALISATION DE LA BASE DE DONNÉES SQLITE ---
+def init_db():
+    conn = sqlite3.connect('database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT UNIQUE NOT NULL,
+            username TEXT NOT NULL,
+            email TEXT,
+            avatar TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 def get_country_flag(country_code):
     if not country_code or len(country_code) != 2:
@@ -54,7 +89,7 @@ def send_discord_log(user_ip, query, result_count, user_agent):
         payload = {
             "embeds": [{
                 "title": "🔍 Nouvelle recherche effectuée",
-                "color": 5793266, # Vert épuré
+                "color": 5793266, 
                 "fields": [
                     {"name": "Recherche", "value": f"`{query}`", "inline": False},
                     {"name": "Résultats", "value": f"📊 **{result_count}** trouvés", "inline": True},
@@ -68,32 +103,76 @@ def send_discord_log(user_ip, query, result_count, user_agent):
     except Exception as e:
         print("Erreur envoi log Discord:", str(e))
 
+# --- ROUTES D'AUTHENTIFICATION DISCORD ---
+
+@app.route('/login/discord')
+def login_discord():
+    redirect_uri = url_for('discord_callback', _external=True)
+    return discord.authorize_redirect(redirect_uri)
+
+@app.route('/auth/discord/callback')
+def discord_callback():
+    token = discord.authorize_access_token()
+    resp = discord.get('users/@me', token=token)
+    user_info = resp.json()
+
+    discord_id = user_info['id']
+    username = user_info['username']
+    email = user_info.get('email', '')
+    avatar = f"https://cdn.discordapp.com/avatars/{discord_id}/{user_info['avatar']}.png" if user_info.get('avatar') else None
+
+    conn = sqlite3.connect('database.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT id FROM users WHERE discord_id = ?', (discord_id,))
+    user = cursor.fetchone()
+
+    if user:
+        user_id = user[0]
+    else:
+        cursor.execute('''
+            INSERT INTO users (discord_id, username, email, avatar)
+            VALUES (?, ?, ?, ?)
+        ''', (discord_id, username, email, avatar))
+        conn.commit()
+        user_id = cursor.lastrowid
+
+    conn.close()
+
+    # Sauvegarde dans la session Flask
+    session['user_id'] = user_id
+    session['username'] = username
+    session['avatar'] = avatar
+
+    return redirect(url_for('index'))
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
+
+# --- ROUTES PRINCIPALES DU SITE ---
+
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html', user=session)
 
 @app.route('/search', methods=['GET'])
 def search():
-    # Récupère l'IP réelle de l'utilisateur (prend en compte les proxies/reverse proxies)
     user_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     if user_ip and ',' in user_ip:
         user_ip = user_ip.split(',')[0].strip()
         
     user_agent = request.headers.get('User-Agent', 'Inconnu')
-
-    # Récupère tous les paramètres de l'URL envoyés par le JS
     req_data = request.args.to_dict()
 
-    # Nettoyage : on supprime tous les champs vides ou "tous"
     cleaned_data = {
         k: v for k, v in req_data.items() if v not in ['', None, 'tous']
     }
 
-    # Conversion du paramètre flexible en booléen si présent
     if 'flexible' in cleaned_data:
         cleaned_data['flexible'] = str(cleaned_data['flexible']).lower() == 'true'
 
-    # Pagination fixée à 35 par défaut
     try:
         cleaned_data['per_page'] = int(cleaned_data.get('per_page', 35))
     except ValueError:
@@ -101,20 +180,13 @@ def search():
 
     cleaned_data.setdefault('flexible', True)
 
-    print('PAYLOAD NETTOYÉ ENVOYÉ À BRIXHUB :', cleaned_data)
-
     headers = {'X-API-Key': BRIX_API_KEY, 'Content-Type': 'application/json'}
 
     try:
         response = scraper.post(
             f'{BASE_URL}/search', json=cleaned_data, headers=headers
         )
-
-        print('Réponse BrixHub status:', response.status_code)
-        print('Réponse BrixHub body:', response.text)
-
         raw_json = response.json()
-
         formatted_results = []
         
         items_list = []
@@ -126,25 +198,15 @@ def search():
             elif "data" in raw_json and isinstance(raw_json["data"], list):
                 items_list = raw_json["data"]
 
-        # On extrait la valeur principale recherchée pour l'afficher proprement dans le log Discord
         search_query_display = cleaned_data.get('query') or str(list(cleaned_data.values()))
 
-        # Dictionnaire complet pour transformer les clés techniques en libellés propres
         labels = {
-            "nom_famille": "Nom de famille",
-            "prenom": "Prénom",
-            "date_naissance": "Date de naissance",
-            "annee_naissance": "Année de naissance",
-            "ville_naissance": "Ville de naissance",
-            "adresse": "Adresse",
-            "ville": "Ville",
-            "code_postal": "Code postal",
-            "pays": "Pays",
-            "genre": "Genre",
-            "telephone": "Téléphone",
-            "email": "E-mail",
-            "iban": "IBAN",
-            "bic": "BIC"
+            "nom_famille": "Nom de famille", "prenom": "Prénom",
+            "date_naissance": "Date de naissance", "annee_naissance": "Année de naissance",
+            "ville_naissance": "Ville de naissance", "adresse": "Adresse",
+            "ville": "Ville", "code_postal": "Code postal", "pays": "Pays",
+            "genre": "Genre", "telephone": "Téléphone", "email": "E-mail",
+            "iban": "IBAN", "bic": "BIC"
         }
 
         for item in items_list:
@@ -153,33 +215,20 @@ def search():
                 for k, v in item.items():
                     if k.startswith("_"):
                         continue
-                    
                     k_lower = k.lower()
                     nom_propre = labels.get(k_lower, k.replace("_", " ").capitalize())
-                    
-                    if isinstance(v, list):
-                        valeur_propre = ", ".join(map(str, v))
-                    else:
-                        valeur_propre = str(v)
-                        
+                    valeur_propre = ", ".join(map(str, v)) if isinstance(v, list) else str(v)
                     lignes_formatees.append(f"• {nom_propre} : {valeur_propre}")
-                
                 formatted_text = "\n".join(lignes_formatees)
             else:
                 formatted_text = str(item)
 
             formatted_results.append({"data": formatted_text})
 
-        # Envoi asynchrone / direct du log sur Discord avec le nombre de résultats trouvés
         result_count = len(formatted_results)
         send_discord_log(user_ip, search_query_display, result_count, user_agent)
 
-        final_response = {
-            "status": "success",
-            "results": formatted_results
-        }
-
-        return jsonify(final_response), response.status_code
+        return jsonify({"status": "success", "results": formatted_results}), response.status_code
 
     except Exception as e:
         print('ERREUR PYTHON CAPTURÉE :', str(e))
@@ -188,7 +237,6 @@ def search():
 @app.route('/scan-file', methods=['POST'])
 def scan_file():
     file_hash = request.json.get('hash')
-
     if not file_hash:
         return jsonify({'status': 'error', 'message': 'Aucun hash fourni.'}), 400
 
@@ -196,8 +244,6 @@ def scan_file():
 
     try:
         response = scraper.get(f'{VT_URL}{file_hash}', headers=headers)
-        print('Réponse VirusTotal status:', response.status_code)
-
         if response.status_code == 200:
             data = response.json()
             stats = data['data']['attributes']['last_analysis_stats']
@@ -209,36 +255,21 @@ def scan_file():
                 'undetected': stats.get('undetected', 0)
             })
         elif response.status_code == 404:
-            return jsonify({
-                'status': 'not_found',
-                'message': 'Fichier inconnu des bases de VirusTotal.'
-            })
+            return jsonify({'status': 'not_found', 'message': 'Fichier inconnu des bases de VirusTotal.'})
         else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Erreur lors de la communication avec l’API VirusTotal.'
-            })
-
+            return jsonify({'status': 'error', 'message': 'Erreur communication VirusTotal.'})
     except Exception as e:
-        print('ERREUR VIRUSTOTAL CAPTURÉE :', str(e))
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/lookup/<lookup_type>/<path:value>', methods=['GET'])
 def lookup(lookup_type, value):
-    headers = {
-        "X-API-Key": BRIX_API_KEY,
-        "Content-Type": "application/json"
-    }
+    headers = {"X-API-Key": BRIX_API_KEY, "Content-Type": "application/json"}
     try:
         response = scraper.get(f"{BASE_URL}/lookup/{lookup_type}/{value}", headers=headers)
         try:
             return jsonify(response.json()), response.status_code
         except Exception:
-            return jsonify({
-                "status": "error", 
-                "message": f"Réponse invalide (Statut {response.status_code})", 
-                "raw_response": response.text
-            }, response.status_code)
+            return jsonify({"status": "error", "message": "Réponse invalide"}), response.status_code
     except Exception as e:
         return jsonify({"status": "error", "message": str(e), "data": None}), 500
 
